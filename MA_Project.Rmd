@@ -1,0 +1,281 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+
+#install.packages("gbm")
+#install.packages("caret")
+#install.packages("fastDummies")
+library(shiny)
+library(shinydashboard)
+library(ggplot2)
+library(randomForest)
+library(caret)
+library(fastDummies)
+library(xgboost)
+library(gbm)
+library(rpart)
+```
+
+
+```{r}
+load("DeliveryAdClick.RData")
+
+#Setting up the output Data
+# # Finding the mode (most common category) for Restaurant_Type
+mode_restaurant_type <- names(sort(table(ClickTraining$Restaurant_Type), decreasing = TRUE))[1]
+mode_restaurant_type_pred <- names(sort(table(ClickPrediction$Restaurant_Type), decreasing = TRUE))[1]
+
+# # Replacing the missing values with the mode
+ClickTraining$Restaurant_Type[is.na(ClickTraining$Restaurant_Type)] <- mode_restaurant_type
+ClickPrediction$Restaurant_Type[is.na(ClickPrediction$Restaurant_Type)] <- mode_restaurant_type_pred
+
+# One-hot encode the categorical variables
+ClickTraining <- dummy_cols(ClickTraining, select_columns = c("Region", "Carrier", "Weekday", "Social_Network", "Restaurant_Type"))
+ClickPrediction <- dummy_cols(ClickPrediction, select_columns = c("Region", "Carrier", "Weekday", "Social_Network", "Restaurant_Type"))
+
+# Preprocess 'Time_On_Previous_Website' using centering and scaling
+preproc_time <- preProcess(ClickTraining[, "Time_On_Previous_Website", drop = FALSE], method = c("center", "scale"))
+ClickTraining[, "Time_On_Previous_Website"] <- predict(preproc_time, ClickTraining[, "Time_On_Previous_Website", drop = FALSE])
+ClickPrediction[, "Time_On_Previous_Website"] <- predict(preproc_time, ClickPrediction[, "Time_On_Previous_Website", drop = FALSE])
+
+# Preprocess 'Number_of_Previous_Orders' using median imputation and range normalization
+preproc_orders <- preProcess(ClickTraining[, "Number_of_Previous_Orders", drop = FALSE], method = c("medianImpute", "range"))
+ClickTraining[, "Number_of_Previous_Orders"] <- predict(preproc_orders, ClickTraining[, "Number_of_Previous_Orders", drop = FALSE])
+ClickPrediction[, "Number_of_Previous_Orders"] <- predict(preproc_orders, ClickPrediction[, "Number_of_Previous_Orders", drop = FALSE])
+
+time_on_previous_mean <- preproc_time$mean[2]
+time_on_previous_std <- preproc_time$std[2]
+#Number_of_Previous_Orders_mean <- preproc_pred$mean[3]
+#Number_of_Previous_Orders_std <- preproc_pred$std[3]
+
+# Drop the original non-numeric categorical columns
+ClickTraining <- ClickTraining[, !(names(ClickTraining) %in% c("Region", "Carrier", "Weekday", "Social_Network", "Restaurant_Type"))]
+
+# Set the seed for reproducibility
+set.seed(123)
+# Create indexes for training and testing
+indexes <- createDataPartition(ClickTraining$Clicks_Conversion, p = 0.8, list = FALSE)
+
+# Create training and testing datasets
+train_data <- ClickTraining[indexes, ]
+test_data <- ClickTraining[-indexes, ]
+
+# Now we can proceed with creating train_X, train_Y, test_X, test_Y
+train_X <- train_data[, -which(names(train_data) == "Clicks_Conversion")]
+train_Y <- train_data$Clicks_Conversion
+test_X <- test_data[, -which(names(test_data) == "Clicks_Conversion")]
+test_Y <- test_data$Clicks_Conversion
+
+#Top 15 features we got from XGB
+columns_to_keep <- c("Carrier_Free", "Daytime", "Time_On_Previous_Website", 
+                     "Weekday_Tuesday", "Weekday_Monday", "Social_Network_Facebook", 
+                     "Number_of_Previous_Orders", "Restaurant_Type_Groceries", 
+                     "Restaurant_Type_Sushi", "Restaurant_Type_French", 
+                     "Social_Network_Instagram", "Weekday_Saturday", 
+                     "Social_Network_Twitter", "Weekday_Friday", "Carrier_Bouygues")
+
+# Create the new dataframe with only the specified columns
+train_X_top15 <- train_X[, columns_to_keep]
+test_X_top15 <- test_X[, columns_to_keep]
+ClickPred_top15 <- ClickPrediction[, columns_to_keep]
+```
+
+```{r}
+str(train_data)
+str(test_data)
+```
+
+
+```{r}
+str(train_X)
+str(train_Y)
+```
+
+```{r}
+str(test_X)
+str(test_Y)
+```
+```{r}
+str(ClickPrediction)
+```
+
+
+```{r}
+# Decision Tree
+model_dt <- rpart(`Clicks_Conversion` ~ ., data = train_data, method = "class")
+pred_dt <- predict(model_dt, newdata = test_data, type = "prob")[, 2]
+output_dt <- predict(model_dt, newdata = ClickPrediction, type = "prob")[, 2]
+```
+
+
+
+```{r}
+train_Y_rf <- factor(train_Y, levels = c(0, 1))
+test_Y_rf <- factor(test_Y, levels = c(0, 1))
+model_rf_def <- randomForest(Clicks_Conversion ~ ., data = data.frame(Clicks_Conversion = train_Y_rf, train_X))
+```
+
+
+```{r}
+#Random Forest
+ClickPred_rf <- ClickPrediction[, !(names(ClickTraining) %in% c("Region", "Carrier", "Weekday", "Social_Network", "Restaurant_Type"))]
+train_Y_rf <- factor(train_Y, levels = c(0, 1))
+test_Y_rf <- factor(test_Y, levels = c(0, 1))
+# Train the Random Forest model with the best hyperparameters
+model_rf <- randomForest(
+    Clicks_Conversion ~ .,
+    data = data.frame(Clicks_Conversion = train_Y_rf, train_X),
+    mtry = 10,
+    ntree = 200
+  )
+pred_rf <- predict(model_rf, newdata = data.frame(test_X), type = "prob")[, 2]
+output_rf <- predict(model_rf, newdata = data.frame(ClickPred_rf), type = "prob")[, 2]
+
+
+```
+
+
+
+```{r}
+
+# XGB
+class_weights <- table(train_Y) / length(train_Y)
+scale_pos_weight <- 1 / class_weights[2]
+best_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  nrounds = 50,
+  max_depth = 9,
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 10,
+  subsample = 0.8,
+  scale_pos_weight = scale_pos_weight
+)
+
+class_weights <- table(train_Y) / length(train_Y)
+scale_pos_weight <- 1 / class_weights[2]
+
+train_Y <- as.factor(train_Y)
+test_Y <- as.factor(test_Y)
+
+
+# Create DMatrix
+dtrain <- xgb.DMatrix(as.matrix(train_X_top15), label = as.numeric(train_Y) - 1)
+dtest <- xgb.DMatrix(as.matrix(test_X_top15), label = as.numeric(test_Y) - 1)
+
+# Train the model with the best hyperparameters
+model_xgb <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = 100, #best_params$nrounds,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10
+)
+
+pred_xgb <- predict(model_xgb, newdata = as.matrix(test_X_top15))
+output_xgb <- predict(model_xgb, newdata = as.matrix(ClickPred_top15), type = "response")
+```
+
+```{r}
+#KNN
+library(class)
+# Set the number of neighbors
+k <- 5  # This is an example; you might want to tune this parameter
+
+# Train KNN model and make predictions
+# Ensure that your data is scaled or normalized before this step, especially for KNN
+pred_knn <- knn(train = as.matrix(train_X_top15), test = as.matrix(test_X_top15), cl = train_Y, k = k)
+output_knn_fact <- knn(train = as.matrix(train_X_top15), test = as.matrix(ClickPred_top15), cl = train_Y, k = k)
+# Convert predictions to numeric if they're factors (depends on how your 'train_Y' is formatted)
+output_knn <- as.numeric(as.character(output_knn_fact))
+binary_output_knn <- output_knn
+```
+
+```{r}
+#Logistic Regression
+# Ensure train_Y and test_Y are factors
+train_Y <- factor(train_Y, levels = c(0, 1))
+test_Y <- factor(test_Y, levels = c(0, 1))
+
+# Fit the Logistic Regression Model
+model_logistic <- glm(Clicks_Conversion ~ ., family = binomial(link = 'logit'), data = data.frame(Clicks_Conversion = train_Y, train_X))
+
+# Make predictions on the test set
+pred_logistic <- predict(model_logistic, newdata = data.frame(test_X), type = "response")
+output_logistic <- predict(model_logistic, newdata = data.frame(ClickPrediction), type = "response")
+```
+
+
+```{r}
+binary_output_dt <- ifelse(output_dt >= 0.5, 1, 0)
+binary_output_xgb <- ifelse(output_xgb >= 0.5, 1, 0)
+#binary_output_knn <- ifelse(output_knn >= 0.5, 1, 0)
+binary_output_logistic <- ifelse(output_logistic >= 0.5, 1, 0)
+binary_output_rf <- ifelse(output_rf >= 0.5, 1, 0)
+
+```
+
+```{r}
+#Ensemble
+
+# Convert predicted probabilities to numeric predictions for XGBoost (0 or 1)
+#pred_numeric_xgb_top_final <- ifelse(pred_probs_xgb_top_final > 0.5, 1, 0)
+
+# Convert predicted probabilities to numeric predictions for Random Forest (0 or 1)
+#pred_numeric_rf_all_final <- ifelse(pred_probs_rf_all_final > 0.5, 1, 0)
+
+# Calculate the average prediction from XGB and RF
+output_ensemble <- (binary_output_rf + binary_output_xgb) / 2
+
+# Convert the average probabilities to binary predictions based on a threshold (e.g., 0.5)
+binary_output_ensemble <- ifelse(output_ensemble >= 0.5, 1, 0)
+```
+
+
+
+```{r}
+# Counting the number of rows in the ClickPrediction dataframe
+num_rows_ClickPrediction <- nrow(ClickPrediction)
+
+# If output_dt is a vector or a column in a dataframe
+num_rows_output_dt <- length(output_dt)
+num_rows_output_xgb <- length(output_xgb)
+num_rows_output_knn <- length(output_knn)
+num_rows_output_rf <- length(output_rf)
+num_rows_output_ensemble <- length(output_ensemble)
+num_rows_output_logistic <- length(output_logistic)
+# If output_dt is a dataframe itself
+# num_rows_output_dt <- nrow(output_dt)
+
+# Print the counts
+print(paste("Number of rows in ClickPrediction:", num_rows_ClickPrediction))
+print(paste("Number of rows in output_dt:", num_rows_output_dt))
+print(paste("Number of rows in output_knn:", num_rows_output_knn))
+print(paste("Number of rows in output_xgb:", num_rows_output_xgb))
+print(paste("Number of rows in output_ensemble:", num_rows_output_ensemble))
+print(paste("Number of rows in output_rf:", num_rows_output_rf))
+print(paste("Number of rows in output_logistic:", num_rows_output_logistic))
+
+```
+
+
+
+```{r}
+library(dplyr)
+ClickPrediction <- mutate(ClickPrediction, output_dt, output_knn, output_xgb, output_ensemble, output_logistic, output_rf, binary_output_dt, binary_output_knn, binary_output_xgb, binary_output_ensemble, binary_output_logistic, binary_output_rf)
+```
+
+
+```{r}
+ClickPrediction
+```
+
+
+
